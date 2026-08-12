@@ -21,6 +21,7 @@ actions to the control loop, so these tests check the loop's bookkeeping (warm s
 delay estimation, emission counts, guards) rather than anything about denoising quality.
 """
 
+import logging
 import time
 from collections import deque
 from threading import Event
@@ -35,10 +36,9 @@ ACTION_DIM = 6
 
 
 class _FakeConfig:
-    def __init__(self, state_in_suffix=False):
+    def __init__(self):
         self.chunk_size = CHUNK_SIZE
         self.rtc_training_schedule = "staircase"
-        self.state_in_suffix = state_in_suffix
 
 
 class _FakeSlowChannel:
@@ -49,36 +49,27 @@ class _FakeSlowChannel:
 class _FakePolicy:
     """Stands in for a staircase-trained pi0.5: records calls, returns recognizable actions."""
 
-    def __init__(self, state_in_suffix=False):
-        self.config = _FakeConfig(state_in_suffix)
+    def __init__(self):
+        self.config = _FakeConfig()
         self.warm_starts = 0
         self.substep_delays: list[int] = []
         self.slow_channel_calls = 0
-        self.seen_states: list[object] = []
-        self.seen_vlm_delays: list[int | None] = []
-
-    @property
-    def supports_async_slow_channel(self):
-        return self.config.state_in_suffix
+        self.seen_prefixes: list[object] = []
 
     def reset(self):
         pass
-
-    def prepare_state(self, batch):
-        return torch.zeros(1, ACTION_DIM) if self.config.state_in_suffix else None
 
     def encode_slow_channel(self, batch):
         self.slow_channel_calls += 1
         return _FakeSlowChannel(captured_at=time.perf_counter())
 
-    def warm_start_realtime_buffer(self, slow, delay, state=None, vlm_delay=None):
+    def warm_start_realtime_buffer(self, slow, delay):
         self.warm_starts += 1
         return torch.zeros(1, CHUNK_SIZE, ACTION_DIM)
 
-    def realtime_substep(self, slow, buffer, delay, state=None, vlm_delay=None):
+    def realtime_substep(self, slow, buffer, delay):
         self.substep_delays.append(delay)
-        self.seen_states.append(state)
-        self.seen_vlm_delays.append(vlm_delay)
+        self.seen_prefixes.append(slow)
         # Tag every emitted action with the call index so the test can spot duplicates.
         emitted = torch.full((1, delay, ACTION_DIM), float(len(self.substep_delays)))
         return emitted, buffer
@@ -182,6 +173,9 @@ def _run_iterations(engine, policy, iterations):
     engine._obs_holder = {"obs": {}, "robot_type": "fake"}  # noqa: SLF001
     engine.notify_observation({})
     engine.resume()
+    if engine._slow is None:  # noqa: SLF001
+        # Stand in for the VLM thread, which the loop cannot run without.
+        engine._slow = policy.encode_slow_channel({})  # noqa: SLF001
     for _ in range(iterations):
         engine._shutdown_event.clear()  # noqa: SLF001
         _single_iteration(engine)
@@ -213,37 +207,22 @@ def test_buffer_is_warm_started_once_and_then_carried_across_calls():
     assert len(policy.substep_delays) == 3
 
 
-def test_prompt_state_checkpoints_re_encode_the_prefix_every_call():
-    # State in the prompt means the cache holds joint state, so reusing it would freeze the fast
-    # channel; the engine must pay the backbone per call instead.
-    policy = _FakePolicy(state_in_suffix=False)
+def test_substeps_reuse_one_cached_prefix_instead_of_re_encoding():
+    # The whole point of the slow channel: the backbone runs on its own thread, and the denoising
+    # loop never pays for it.
+    policy = _FakePolicy()
     engine = _make_engine(policy=policy)
-    assert not engine._async_slow_channel  # noqa: SLF001
-
-    _run_iterations(engine, policy, 3)
-
-    assert policy.slow_channel_calls == 3
-    assert policy.seen_states == [None, None, None]
-
-
-def test_suffix_state_checkpoints_reuse_the_cached_prefix_with_fresh_state():
-    policy = _FakePolicy(state_in_suffix=True)
-    engine = _make_engine(policy=policy)
-    assert engine._async_slow_channel  # noqa: SLF001
-
-    # Stand in for the VLM thread: one cache, published once.
     engine._slow = policy.encode_slow_channel({})  # noqa: SLF001
+
     _run_iterations(engine, policy, 3)
 
-    # Three substeps against a single prefix encode.
     assert policy.slow_channel_calls == 1
     assert len(policy.substep_delays) == 3
-    # And every one of them received fresh proprioception.
-    assert all(state is not None for state in policy.seen_states)
+    assert all(prefix is engine._slow for prefix in policy.seen_prefixes)  # noqa: SLF001
 
 
-def test_denoise_loop_waits_for_the_first_cache_when_the_vlm_thread_is_async():
-    policy = _FakePolicy(state_in_suffix=True)
+def test_denoise_loop_waits_for_the_first_cache():
+    policy = _FakePolicy()
     engine = _make_engine(policy=policy)
     engine._obs_holder = {"obs": {}, "robot_type": "fake"}  # noqa: SLF001
     engine.resume()
@@ -256,14 +235,28 @@ def test_denoise_loop_waits_for_the_first_cache_when_the_vlm_thread_is_async():
     assert policy.substep_delays == []
 
 
-def test_prefix_age_is_reported_to_the_policy_in_control_steps():
-    policy = _FakePolicy(state_in_suffix=True)
+def test_a_badly_stale_prefix_is_reported(caplog):
+    policy = _FakePolicy()
     engine = _make_engine(policy=policy)
-    # A cache captured two control steps ago at 30 fps.
-    engine._slow = _FakeSlowChannel(captured_at=time.perf_counter() - 2 / 30.0)  # noqa: SLF001
-    _run_iterations(engine, policy, 1)
+    # Older than a whole chunk at 30 fps, so the plan behind the clean front is out of date.
+    engine._slow = _FakeSlowChannel(captured_at=time.perf_counter() - 2 * CHUNK_SIZE / 30.0)  # noqa: SLF001
 
-    assert policy.seen_vlm_delays[0] in (1, 2)
+    with caplog.at_level(logging.WARNING):
+        _run_iterations(engine, policy, 1)
+
+    assert "control steps old" in caplog.text
+    # Stale is degraded, not fatal: the substep still runs.
+    assert len(policy.substep_delays) == 1
+
+
+def test_a_fresh_prefix_is_not_reported_as_stale(caplog):
+    policy = _FakePolicy()
+    engine = _make_engine(policy=policy)
+
+    with caplog.at_level(logging.WARNING):
+        _run_iterations(engine, policy, 1)
+
+    assert "control steps old" not in caplog.text
 
 
 def test_every_substep_emits_exactly_delay_actions():

@@ -51,7 +51,6 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
-    OBS_STATE,
 )
 
 from ..common.flow_matching import (
@@ -609,14 +608,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # piR2 fast channel: state reaches the expert as its own suffix token instead of as text in
-        # the prompt, so it can be refreshed without invalidating the prefix cache (as pi0 does).
-        if config.state_in_suffix:
-            self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
-        # Tells the expert how many control steps old the cached prefix is.
-        if config.vlm_delay_max > 0:
-            self.vlm_delay_proj = nn.Linear(action_expert_config.width, action_expert_config.width)
-
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -709,13 +700,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep, state=None, vlm_delay=None):
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
-
-        With ``state_in_suffix`` the state is prepended as its own token so the expert can attend
-        to fresh proprioception on every call; ``vlm_delay`` (in control steps) is folded into the
-        AdaRMS conditioning so the expert knows how stale the cached prefix is.
-        """
+    def embed_suffix(self, noisy_actions, timestep):
+        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         att_masks = []
 
         # Embed timestep using sine-cosine positional encoding
@@ -743,53 +729,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
         adarms_cond = time_emb
 
-        if vlm_delay is not None:
-            if not hasattr(self, "vlm_delay_proj"):
-                raise ValueError("vlm_delay was provided but the model was built with vlm_delay_max=0")
-            # Normalized to [0, 1] so the same sinusoidal basis as the flow timestep applies.
-            delay_emb = create_sinusoidal_pos_embedding(
-                vlm_delay.to(dtype=time_emb.dtype) / max(self.config.vlm_delay_max, 1),
-                self.action_in_proj.out_features,
-                min_period=self.config.min_period,
-                max_period=self.config.max_period,
-                device=time_emb.device,
-            )
-            delay_cond = self.vlm_delay_proj(delay_emb.type(dtype=time_emb.dtype))
-            # adarms_cond may be per-token (B, T, W) once a staircase schedule is in play, while the
-            # staleness is one number per sample.
-            if adarms_cond.ndim == 3 and delay_cond.ndim == 2:
-                delay_cond = delay_cond.unsqueeze(1)
-            adarms_cond = adarms_cond + delay_cond
-
-        embs = action_emb
-        if state is not None:
-            if not hasattr(self, "state_proj"):
-                raise ValueError("state was provided but the model was built with state_in_suffix=False")
-
-            def state_proj_func(state):
-                return self.state_proj(state)
-
-            state_emb = self._apply_checkpoint(state_proj_func, state.to(dtype=action_emb.dtype))
-            embs = torch.cat([state_emb[:, None, :], action_emb], dim=1)
-            # The state token shares the action tokens' modulation; it carries no flow timestep of
-            # its own, so it reuses the first position's conditioning when that is per-token.
-            if adarms_cond.ndim == 3:
-                adarms_cond = torch.cat([adarms_cond[:, :1], adarms_cond], dim=1)
-
-        bsize, action_time_dim = embs.shape[:2]
+        bsize, action_time_dim = action_emb.shape[:2]
         pad_masks = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        if state is not None:
-            # The state token opens a new attention block; the action tokens then attend to it and
-            # to each other, matching pi0's suffix layout.
-            att_masks += [1] + [1] + ([0] * (self.config.chunk_size - 1))
-        else:
-            att_masks += [1] + ([0] * (self.config.chunk_size - 1))
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+        att_masks = torch.tensor(att_masks, dtype=action_emb.dtype, device=action_emb.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
+        return action_emb, pad_masks, att_masks, adarms_cond
 
     def forward(
         self,
@@ -802,17 +750,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time,
         prefix_mask: Tensor | None = None,
         position_time: Tensor | None = None,
-        state: Tensor | None = None,
-        vlm_delay: Tensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         x_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask, position_time)
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
-            x_t, model_time, state=state, vlm_delay=vlm_delay
-        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -863,8 +807,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
-        state=None,
-        vlm_delay=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -904,7 +846,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )
 
         return euler_integrate(
-            self._prefix_denoise_fn(prefix_pad_masks, past_key_values, state, vlm_delay),
+            self._prefix_denoise_fn(prefix_pad_masks, past_key_values),
             noise,
             num_steps,
             rtc_processor=self.rtc_processor,
@@ -939,14 +881,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         return prefix_pad_masks, past_key_values
 
-    def _prefix_denoise_fn(self, prefix_pad_masks, past_key_values, state=None, vlm_delay=None):
+    def _prefix_denoise_fn(self, prefix_pad_masks, past_key_values):
         return lambda x_t, timestep: self.denoise_step(
             prefix_pad_masks=prefix_pad_masks,
             past_key_values=past_key_values,
             x_t=x_t,
             timestep=timestep,
-            state=state,
-            vlm_delay=vlm_delay,
         )
 
     def warm_start_staircase_buffer(
@@ -957,8 +897,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         *,
         noise=None,
         num_steps=None,
-        state=None,
-        vlm_delay=None,
     ) -> Tensor:
         """Denoise a full chunk from pure noise, then re-noise it onto the staircase.
 
@@ -973,20 +911,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             shape = (prefix_pad_masks.shape[0], self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(shape, prefix_pad_masks.device)
 
-        clean = euler_integrate(
-            self._prefix_denoise_fn(prefix_pad_masks, past_key_values, state, vlm_delay), noise, num_steps
-        )
+        clean = euler_integrate(self._prefix_denoise_fn(prefix_pad_masks, past_key_values), noise, num_steps)
 
         time = staircase_time(delay, clean.shape[1], device=clean.device, dtype=clean.dtype)
         fresh = self.sample_noise(clean.shape, clean.device).to(dtype=clean.dtype)
         return time[None, :, None] * fresh + (1 - time[None, :, None]) * clean
 
-    def staircase_denoise_step(
-        self, prefix_pad_masks, past_key_values, x_t, delay, *, noise=None, state=None, vlm_delay=None
-    ):
+    def staircase_denoise_step(self, prefix_pad_masks, past_key_values, x_t, delay, *, noise=None):
         """One piR2 call against a cached prefix: emit ``delay`` actions and slide the buffer."""
         return staircase_substep(
-            self._prefix_denoise_fn(prefix_pad_masks, past_key_values, state, vlm_delay),
+            self._prefix_denoise_fn(prefix_pad_masks, past_key_values),
             x_t,
             delay,
             noise=noise,
@@ -998,13 +932,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
-        state=None,
-        vlm_delay=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
-            x_t, timestep, state=state, vlm_delay=vlm_delay
-        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1351,18 +1281,6 @@ class PI05Policy(PreTrainedPolicy):
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
 
-    def prepare_state(self, batch):
-        """Pad state for the fast channel, or ``None`` when state travels in the prompt instead."""
-        if not self.config.state_in_suffix:
-            return None
-        return pad_vector(batch[OBS_STATE], self.config.max_state_dim)
-
-    def _sample_vlm_delay(self, batch_size: int, device) -> Tensor | None:
-        """Draw the prefix staleness the expert is asked to tolerate this batch."""
-        if self.config.vlm_delay_max <= 0:
-            return None
-        return torch.randint(0, self.config.vlm_delay_max + 1, (batch_size,), device=device)
-
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
@@ -1390,9 +1308,7 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs)
-        actions = self.model.sample_actions(
-            images, img_masks, tokens, masks, state=self.prepare_state(batch), **kwargs
-        )
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1417,47 +1333,18 @@ class PI05Policy(PreTrainedPolicy):
             captured_at=time.perf_counter(),
         )
 
-    @property
-    def supports_async_slow_channel(self) -> bool:
-        """True when the prefix can be reused across calls without freezing proprioception."""
-        return bool(self.config.state_in_suffix)
-
-    def _clamp_vlm_delay(self, vlm_delay: int | None, device) -> Tensor | None:
-        if vlm_delay is None or self.config.vlm_delay_max <= 0:
-            return None
-        return torch.tensor([min(vlm_delay, self.config.vlm_delay_max)], device=device)
-
     @torch.no_grad()
-    def warm_start_realtime_buffer(
-        self,
-        slow: PiR2SlowChannel,
-        delay: int,
-        state: Tensor | None = None,
-        vlm_delay: int | None = None,
-    ) -> Tensor:
+    def warm_start_realtime_buffer(self, slow: PiR2SlowChannel, delay: int) -> Tensor:
         """Build the initial action buffer at episode start, when nothing is in flight yet."""
         self.eval()
-        return self.model.warm_start_staircase_buffer(
-            slow.prefix_pad_masks,
-            slow.past_key_values,
-            delay,
-            state=state,
-            vlm_delay=self._clamp_vlm_delay(vlm_delay, slow.prefix_pad_masks.device),
-        )
+        return self.model.warm_start_staircase_buffer(slow.prefix_pad_masks, slow.past_key_values, delay)
 
     @torch.no_grad()
-    def realtime_substep(
-        self,
-        slow: PiR2SlowChannel,
-        buffer: Tensor,
-        delay: int,
-        state: Tensor | None = None,
-        vlm_delay: int | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    def realtime_substep(self, slow: PiR2SlowChannel, buffer: Tensor, delay: int) -> tuple[Tensor, Tensor]:
         """Advance the buffer by one denoising step, returning ``delay`` finished actions.
 
-        ``state`` is piR2's fast channel: pass the latest proprioception here and the expert sees
-        it even though ``slow`` may have been encoded several control steps ago.
+        ``slow`` may have been encoded several control steps ago; the clamped clean front of
+        ``buffer`` is what tells the expert where the robot currently is.
         """
         self.eval()
         emitted, next_buffer = self.model.staircase_denoise_step(
@@ -1465,8 +1352,6 @@ class PI05Policy(PreTrainedPolicy):
             slow.past_key_values,
             buffer,
             delay,
-            state=state,
-            vlm_delay=self._clamp_vlm_delay(vlm_delay, buffer.device),
         )
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return emitted[:, :, :original_action_dim], next_buffer
@@ -1516,8 +1401,6 @@ class PI05Policy(PreTrainedPolicy):
             time,
             prefix_mask,
             position_time,
-            state=self.prepare_state(batch),
-            vlm_delay=self._sample_vlm_delay(actions.shape[0], actions.device),
         )
 
         # Truncate losses to actual action dimensions

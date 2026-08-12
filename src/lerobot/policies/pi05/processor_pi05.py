@@ -48,10 +48,6 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
-    # When False the prompt carries task text only and the model reads state from ``OBS_STATE``
-    # through its own projection. This is piR2's fast channel: it takes proprioception out of the
-    # cacheable vision-language prefix so it can be refreshed without re-running the backbone.
-    include_state_in_prompt: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -66,21 +62,14 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         # TODO: check if this necessary
         state = deepcopy(state)
 
-        cleaned_texts = [task.strip().replace("_", " ").replace("\n", " ") for task in tasks]
-
-        if not self.include_state_in_prompt:
-            transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = [
-                f"Task: {text};\nAction: " for text in cleaned_texts
-            ]
-            return transition
-
         # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         state_np = state.cpu().numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         full_prompts = []
-        for i, cleaned_text in enumerate(cleaned_texts):
+        for i, task in enumerate(tasks):
+            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
             state_str = " ".join(map(str, discretized_states[i]))
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             full_prompts.append(full_prompt)
@@ -147,10 +136,7 @@ def make_pi05_pre_post_processors(
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         steps.normalize,
-        Pi05PrepareStateTokenizerProcessorStep(
-            max_state_dim=config.max_state_dim,
-            include_state_in_prompt=not config.state_in_suffix,
-        ),
+        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,

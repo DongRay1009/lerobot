@@ -72,16 +72,6 @@ class PI05Config(PreTrainedConfig):
     # Symmetric per-position jitter added to the staircase to absorb per-call delay variation.
     staircase_time_jitter: float = 0.0
 
-    # piR2 fast channel (arXiv 2607.26055, Sec. 3.2). Upstream pi0.5 discretizes state into the
-    # tokenized prompt, which puts proprioception inside the cacheable vision-language prefix.
-    # Setting this projects state into the action expert's suffix instead (as pi0 does), so it can
-    # be refreshed on every denoising step while the prefix is reused. Changes the prompt format
-    # and adds ``state_proj`` weights, so a checkpoint trained one way cannot run the other.
-    state_in_suffix: bool = False
-    # Condition on how stale the cached prefix is, in control steps, so the policy can tolerate a
-    # vision-language feature that lags. Sampled in [0, vlm_delay_max] during training.
-    vlm_delay_max: int = 0
-
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,
@@ -156,15 +146,6 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"staircase_warmup_prob must be in [0, 1], got {self.staircase_warmup_prob}")
         if not 0.0 <= self.staircase_time_jitter <= 1.0:
             raise ValueError(f"staircase_time_jitter must be in [0, 1], got {self.staircase_time_jitter}")
-
-        if self.vlm_delay_max < 0:
-            raise ValueError(f"vlm_delay_max must be >= 0, got {self.vlm_delay_max}")
-        if self.vlm_delay_max > 0 and not self.state_in_suffix:
-            # A stale prefix is only usable if proprioception can still be refreshed behind it.
-            raise ValueError(
-                "vlm_delay_max > 0 requires state_in_suffix=True; with state inside the prompt a "
-                "stale prefix also means stale proprioception, which is the baseline piR2 beats."
-            )
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")

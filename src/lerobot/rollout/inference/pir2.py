@@ -22,12 +22,13 @@ denoising step on it, hands the finished front to the robot, slides the buffer f
 appends fresh noise at the back -- so the schedule reproduces itself and the robot is fed
 continuously without ever waiting for a full chunk.
 
-Both of the paper's modifications are here, but the fast channel is only available on a
-checkpoint trained with ``--policy.state_in_suffix=true``. Without it, pi0.5 discretizes
-proprioception into the tokenized prompt, so the prefix cache holds joint state too and reusing
-it would freeze the fast channel along with the slow one -- the paper's "Naive Async" baseline.
-The engine detects this and falls back to re-encoding the prefix every call, which keeps the
-observation current at the cost of a much larger per-call delay.
+The vision-language prefix is refreshed by its own thread and reused by every denoising step in
+between, so conditioning updates at the backbone's rate rather than once per chunk. pi0.5
+discretizes proprioception into the tokenized prompt, so a cached prefix holds stale joint state
+as well; what keeps the expert anchored is the clamped clean front of the buffer, which is the
+positions the robot is being commanded to right now. That covers where the arm is, but not the
+gap between commanded and actual, so this engine does not react to external disturbance the way
+the paper's separate proprioception channel does (arXiv 2607.26055, Sec. 3.2).
 """
 
 from __future__ import annotations
@@ -89,7 +90,6 @@ class PiR2InferenceEngine(InferenceEngine):
             "encode_slow_channel",
             "warm_start_realtime_buffer",
             "realtime_substep",
-            "prepare_state",
         )
         for required in required_methods:
             if not hasattr(policy, required):
@@ -120,14 +120,10 @@ class PiR2InferenceEngine(InferenceEngine):
         self._max_delay = min(max_delay or chunk_size // 2, chunk_size // 2)
         self._latencies: deque[float] = deque(maxlen=latency_window)
 
-        self._async_slow_channel = bool(getattr(policy, "supports_async_slow_channel", False))
-        if not self._async_slow_channel:
-            logger.warning(
-                "Checkpoint keeps proprioception in the prompt, so the vision-language prefix "
-                "cannot be cached without freezing joint state. Re-encoding it every call; expect "
-                "a per-call delay dominated by the backbone. Train with "
-                "--policy.state_in_suffix=true to enable the fast channel."
-            )
+        # A prefix older than the chunk it is steering is worth surfacing: the clean front can
+        # only anchor the expert for so long before the plan behind it is answering a dead question.
+        self._stale_prefix_steps = chunk_size
+        self._last_stale_warning = 0.0
 
         self._buffer: torch.Tensor | None = None
         self._slow: Any = None
@@ -158,19 +154,14 @@ class PiR2InferenceEngine(InferenceEngine):
         return self._error.is_set()
 
     def start(self) -> None:
-        """Launch the background denoising thread (and the VLM thread, when the prefix is cacheable)."""
+        """Launch the background denoising thread and the vision-language thread."""
         self._obs_holder = {"obs": None, "robot_type": self._robot.robot_type}
         self._shutdown_event.clear()
         self._thread = Thread(target=self._denoise_loop, daemon=True, name="PiR2Inference")
         self._thread.start()
-        if self._async_slow_channel:
-            self._vlm_thread = Thread(target=self._vlm_loop, daemon=True, name="PiR2VLM")
-            self._vlm_thread.start()
-        logger.info(
-            "piR2 inference started (max delay %d, slow channel %s)",
-            self._max_delay,
-            "async" if self._async_slow_channel else "synchronous",
-        )
+        self._vlm_thread = Thread(target=self._vlm_loop, daemon=True, name="PiR2VLM")
+        self._vlm_thread.start()
+        logger.info("piR2 inference started (max delay %d)", self._max_delay)
 
     def stop(self) -> None:
         """Signal the background threads to stop and wait for them."""
@@ -262,17 +253,24 @@ class PiR2InferenceEngine(InferenceEngine):
             if self._global_shutdown_event is not None:
                 self._global_shutdown_event.set()
 
-    def _current_slow_channel(self, obs: dict) -> tuple[Any, int] | None:
-        """Return the newest prefix cache and its age in control steps."""
-        if not self._async_slow_channel:
-            # State lives in the prompt, so a cache is only valid for the call that built it.
-            return self._policy.encode_slow_channel(self._prepare_batch(obs)), 0
+    def _current_slow_channel(self) -> Any | None:
+        """Return the newest prefix cache, warning when it falls badly behind."""
         with self._slow_lock:
             slow = self._slow
         if slow is None:
             return None
-        age_s = 0.0 if slow.captured_at is None else time.perf_counter() - slow.captured_at
-        return slow, int(age_s * self._fps)
+        now = time.perf_counter()
+        age_s = 0.0 if slow.captured_at is None else now - slow.captured_at
+        age_steps = int(age_s * self._fps)
+        if age_steps > self._stale_prefix_steps and now - self._last_stale_warning > 5.0:
+            self._last_stale_warning = now
+            logger.warning(
+                "piR2 vision-language prefix is %d control steps old (%.2fs); the expert is "
+                "steering on stale vision. Reduce image resolution or camera count.",
+                age_steps,
+                age_s,
+            )
+        return slow
 
     def _denoise_loop(self) -> None:
         try:
@@ -284,35 +282,22 @@ class PiR2InferenceEngine(InferenceEngine):
                     time.sleep(_IDLE_SLEEP_S)
                     continue
 
-                obs = self._latest_observation()
-                if obs is None:
-                    time.sleep(_IDLE_SLEEP_S)
-                    continue
-
                 try:
                     started = time.perf_counter()
                     delay = estimate_pir2_delay(self._latencies, time_per_step, self._max_delay)
 
-                    current = self._current_slow_channel(obs)
-                    if current is None:
+                    slow = self._current_slow_channel()
+                    if slow is None:
                         # The VLM thread has not produced its first cache yet.
                         time.sleep(_IDLE_SLEEP_S)
                         continue
-                    slow, vlm_delay = current
-
-                    # The fast channel: proprioception read now, regardless of the prefix's age.
-                    state = self._policy.prepare_state(self._prepare_batch(obs))
 
                     if self._buffer is None:
                         # Episode start: nothing is in flight, so fall back to a full denoise
                         # and re-noise the result onto the staircase.
-                        self._buffer = self._policy.warm_start_realtime_buffer(
-                            slow, delay, state=state, vlm_delay=vlm_delay
-                        )
+                        self._buffer = self._policy.warm_start_realtime_buffer(slow, delay)
 
-                    emitted, self._buffer = self._policy.realtime_substep(
-                        slow, self._buffer, delay, state=state, vlm_delay=vlm_delay
-                    )
+                    emitted, self._buffer = self._policy.realtime_substep(slow, self._buffer, delay)
                     self._publish(emitted)
 
                     self._latencies.append(time.perf_counter() - started)
