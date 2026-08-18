@@ -17,6 +17,7 @@ import numpy as np
 from scene_memory import Task5SceneMemory
 from placement_recovery import Task5PlacementRecovery
 from failure_detector import Task5FailureDetector
+from vision_scene_memory import VisionTask5SceneMemory
 
 
 OUT = Path(os.environ.get("TRACE_OUT", "./task5_trace"))
@@ -62,6 +63,8 @@ class TraceEnv:
         self._pose_target = None
         self._scene_memory = None
         self._last_scene = None
+        self._vision_scene_memory = None
+        self._last_vision_scene = None
         self._placement_recovery = Task5PlacementRecovery()
         self._failure_detector = Task5FailureDetector()
         self._dir = OUT / name
@@ -84,6 +87,17 @@ class TraceEnv:
             else:
                 self._scene_memory.reset()
             self._last_scene = self._scene_memory.update()
+            vision_enabled = (
+                os.environ.get("VISION_SHADOW", "0") == "1"
+                or os.environ.get("VISION_DETECTOR", "0") == "1"
+                or os.environ.get("VISION_RECOVERY_TARGETS", "0") == "1"
+            )
+            if vision_enabled:
+                if self._vision_scene_memory is None:
+                    self._vision_scene_memory = VisionTask5SceneMemory(self._env)
+                else:
+                    self._vision_scene_memory.reset()
+                self._last_vision_scene = self._vision_scene_memory.update(obs)
             self._placement_recovery.reset()
             self._failure_detector.reset()
         self._last_obs = obs
@@ -109,15 +123,41 @@ class TraceEnv:
             "max_lift_since_close": None,
             "grasp_failed": False,
         }
+        use_vision_detector = os.environ.get("VISION_DETECTOR", "0") == "1"
+        use_vision_recovery_targets = (
+            os.environ.get("VISION_RECOVERY_TARGETS", "0") == "1"
+        )
+        detector_scene = (
+            self._last_vision_scene
+            if use_vision_detector
+            else self._last_scene
+        )
         if not self._placement_recovery.active:
             failure = self._failure_detector.update(
-                original_action, self._last_scene
+                original_action, detector_scene
             )
         if os.environ.get("PLACE_RECOVERY", "0") == "1":
+            recovery_scene = self._last_scene
+            external_trigger = failure["grasp_failed"]
+            if use_vision_detector and detector_scene is not None:
+                # Detection comes exclusively from vision in this hybrid
+                # experiment. Keep GT positions only as recovery targets.
+                external_trigger = (
+                    external_trigger
+                    or detector_scene.get("placement_failed", False)
+                )
+                recovery_scene = dict(self._last_scene)
+                recovery_scene["placement_failed"] = False
+            if use_vision_recovery_targets and detector_scene is not None:
+                # Full oracle-mask RGB-D control experiment: both the trigger
+                # and recovery object targets come from vision. EEF remains
+                # ordinary robot state, as it would through ROS / joint state.
+                recovery_scene = dict(detector_scene)
+                recovery_scene["placement_failed"] = False
             override, place_phase = self._placement_recovery.compute(
                 original_action,
-                self._last_scene,
-                external_trigger=failure["grasp_failed"],
+                recovery_scene,
+                external_trigger=external_trigger,
             )
             if override is not None:
                 action = override
@@ -191,7 +231,13 @@ class TraceEnv:
         obs, reward, terminated, truncated, info = result
         self._last_obs = obs
         scene = self._scene_memory.update() if self._scene_memory is not None else None
+        vision_scene = (
+            self._vision_scene_memory.update(obs)
+            if self._vision_scene_memory is not None
+            else None
+        )
         self._last_scene = scene
+        self._last_vision_scene = vision_scene
         row = {
             "event": "step",
             "step": self._step,
@@ -199,12 +245,19 @@ class TraceEnv:
             "action": _summary(action),
             "recovery_applied": recovery_applied,
             "recovery_phase": phase_executed,
+            "detector_source": (
+                "vision_scene" if use_vision_detector else "scene"
+            ),
+            "recovery_target_source": (
+                "vision_scene" if use_vision_recovery_targets else "scene"
+            ),
             "reward": _summary(reward),
             "terminated": _summary(terminated),
             "truncated": _summary(truncated),
             "info": _summary(info),
             "obs": _summary(obs),
             "scene": scene,
+            "vision_scene": vision_scene,
             "failure": failure,
         }
         self._file.write(json.dumps(row) + "\n")
