@@ -176,3 +176,14 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Local LIBERO evaluation outputs
+/diagnose_*/
+/eval_*/
+/task5_trace*/
+/task5_*trace*/
+/vision_debug/
+/project_artifacts/
+*.jsonl
+/*.mp4
+/*.png
