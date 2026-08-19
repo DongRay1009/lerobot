@@ -34,21 +34,31 @@ The system contains:
   verification, completion, and failure stages;
 - grasp- and placement-failure detectors with temporal confirmation;
 - an object-relative recovery controller that can regrasp and replace the bowl;
-- RGB-D backprojection from the fixed agent-view camera;
+- Grounding DINO open-vocabulary detection and SAM mask prediction;
+- RGB-D backprojection from agent-view and wrist cameras;
 - persistent target identity and confidence-aware landmark memory;
 - shadow-mode comparison between visual estimates and simulator ground truth.
 
 ## Perception milestone
 
-Object positions are estimated from agent-view depth and calibrated camera
-geometry. MuJoCo instance segmentation is currently used only to provide
-oracle object masks. Object body positions are not used by the visual recovery
-controller. End-effector position comes from ordinary robot state.
+Object positions are estimated from RGB images, rendered depth, and calibrated
+camera geometry. Grounding DINO Tiny detects two black bowls, one plate, and
+one ramekin; SAM ViT-B converts the boxes into masks. Masked depth pixels are
+backprojected into world coordinates. End-effector position comes from ordinary
+robot state.
 
-The plate is normally kept as a stable landmark. A relocation is accepted only
-when its mask retains at least 80% of the reset visibility and the measured
-displacement remains spatially consistent for five frames. This prevents bowl
-occlusion from being mistaken for physical plate motion.
+The memory fuses the fixed agent-view and wrist cameras, associates the two
+identical bowls over time, propagates an occluded held target with end-effector
+motion, rejects implausible visual innovations, and retains the reset-time
+plate and ramekin positions as static anchors. A monotonic task state machine
+tracks approach, grasp, transport, place, verification, completion, and
+placement failure. After a release near the plate, failure is declared only if
+the success predicate remains unconfirmed for a temporal verification window.
+
+On a static reset frame, learned-mask IoU against simulator masks ranged from
+0.935 to 0.981. Learned RGB-D object-position error ranged from 0.05 to 0.50 cm.
+After model loading, the median perception latency was 117.5 ms per inference
+frame on an RTX 4090; inference was run every five control steps.
 
 ## Results
 
@@ -56,20 +66,19 @@ All numbers below are observed evaluation results for LIBERO Spatial task 5.
 
 | Configuration | Success | Notes |
 | --- | ---: | --- |
-| PI0.5 baseline | 8/10 | One grasp failure and one placement failure |
+| PI0.5 baseline | 9/10 | Episode 2 ended in a placement failure |
 | Ground-truth scene recovery | 10/10 | Validated recovery logic before perception integration |
-| Visual detector, ground-truth recovery targets | 3/3 | Recovery triggered only for the failed rollout |
-| RGB-D detector and RGB-D recovery targets | 10/10 | Two failed rollouts recovered; eight nominal rollouts were not modified |
+| Oracle-mask RGB-D recovery | 10/10 | Validated 3D estimation and visual closed-loop control |
+| Learned-mask RGB-D recovery | 10/10 | Grounding DINO + SAM detection and recovery targets |
 
-In the final 10-episode RGB-D evaluation:
+In the final 10-episode learned-perception evaluation:
 
-- episode 2 recovered from a placement failure with 127 overridden actions;
-- episode 3 recovered from a grasp failure with 140 overridden actions;
-- the remaining eight episodes received zero recovery actions;
-- no plate relocalization false positives occurred;
-- placement-failure agreement on episode 2 was 97.8%;
-- plate-position p95 error on episode 2 was 0.72 cm;
-- the final task success rate was 100% (10/10).
+- episode 2 recovered from a placement failure with 116 overridden actions;
+- the remaining nine episodes received zero recovery actions;
+- the recovery trigger and bowl/plate target coordinates both came from the
+  learned visual scene memory;
+- no nominal rollout was modified by a false-positive recovery trigger;
+- the final task success rate improved from 90% (9/10) to 100% (10/10).
 
 These results show selective closed-loop intervention rather than unconditional
 scripted control: the learned policy remains in control during nominal
@@ -80,13 +89,19 @@ execution, and the recovery controller acts only after a confirmed failure.
 - `task5_trace.py`: evaluation wrapper and per-step structured trace logging;
 - `scene_memory.py`: simulator-state scene memory used for validation;
 - `vision_scene_memory.py`: RGB-D scene estimation and task-state tracking;
+- `learned_mask_perception.py`: persistent Grounding DINO and SAM inference;
+- `learned_vision_scene_memory.py`: learned-mask multi-view 3D scene memory;
 - `failure_detector.py`: grasp and placement failure detection;
 - `placement_recovery.py`: object-relative recovery state machine;
 - `analyze_scene_traces.py`: ground-truth trace analysis;
 - `analyze_vision_shadow.py`: visual-versus-ground-truth evaluation;
 - `inspect_task5_vision.py`: camera, depth, and segmentation inspection;
 - `inspect_task5_masks.py`: task-object mask inspection;
-- `inspect_task5_backprojection.py`: camera calibration and 3D backprojection.
+- `inspect_task5_backprojection.py`: camera calibration and 3D backprojection;
+- `inspect_task5_learned_detection.py`: open-vocabulary detector inspection;
+- `inspect_task5_learned_masks.py`: learned-mask and oracle-IoU inspection;
+- `inspect_task5_learned_backprojection.py`: learned-mask 3D validation;
+- `benchmark_task5_learned_perception.py`: learned perception latency benchmark.
 
 ## Running the full visual recovery evaluation
 
@@ -94,14 +109,15 @@ From the LeRobot environment:
 
 ```bash
 PLACE_RECOVERY=1 \
-VISION_DETECTOR=1 \
-VISION_RECOVERY_TARGETS=1 \
-TRACE_OUT=./task5_full_vision_recovery_trace_n10 \
+LEARNED_VISION_DETECTOR=1 \
+LEARNED_VISION_RECOVERY_TARGETS=1 \
+LEARNED_VISION_INTERVAL=5 \
+TRACE_OUT=./task5_learned_closed_loop_trace_n10 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
 python task5_trace.py \
-  --output_dir=./eval_task5_full_vision_recovery_n10 \
-  --job_name=task5_full_vision_recovery_n10 \
+  --output_dir=./eval_task5_learned_closed_loop_n10 \
+  --job_name=task5_learned_closed_loop_n10 \
   --policy.path=lerobot/pi05_libero_finetuned \
   --policy.n_action_steps=10 \
   --policy.device=cuda \
@@ -116,17 +132,16 @@ python task5_trace.py \
 
 ## Limitations
 
-- Instance masks come from the simulator rather than a learned segmenter.
 - Recovery skills and task-state thresholds are currently task-specific.
 - Results are from simulation, one task, and a limited number of episodes.
-- Ground-truth scene state is retained for analysis, but not for visual recovery
-  triggers or recovery target coordinates in the final configuration.
+- Simulator state and oracle masks are retained for evaluation traces only;
+  neither supplies final recovery triggers or recovery target coordinates.
 - Larger multi-seed evaluation is required before making a robustness claim.
 
 ## Next steps
 
-1. Replace oracle masks with RGB-based object detection or segmentation.
-2. Fuse agent-view and wrist-camera observations near grasp and placement.
-3. Evaluate multiple seeds and additional LIBERO tasks.
-4. Generalize recovery skills behind task-independent interfaces.
+1. Evaluate multiple seeds and additional LIBERO tasks.
+2. Add controlled grasp, perception, and placement perturbations.
+3. Generalize recovery skills behind task-independent interfaces.
+4. Replace task-calibrated offsets with learned or geometry-derived estimates.
 5. Connect the skill and scene-memory interfaces to ROS 2 actions.

@@ -18,6 +18,7 @@ from scene_memory import Task5SceneMemory
 from placement_recovery import Task5PlacementRecovery
 from failure_detector import Task5FailureDetector
 from vision_scene_memory import VisionTask5SceneMemory
+from learned_vision_scene_memory import LearnedVisionTask5SceneMemory
 
 
 OUT = Path(os.environ.get("TRACE_OUT", "./task5_trace"))
@@ -65,6 +66,8 @@ class TraceEnv:
         self._last_scene = None
         self._vision_scene_memory = None
         self._last_vision_scene = None
+        self._learned_vision_scene_memory = None
+        self._last_learned_vision_scene = None
         self._placement_recovery = Task5PlacementRecovery()
         self._failure_detector = Task5FailureDetector()
         self._dir = OUT / name
@@ -92,12 +95,28 @@ class TraceEnv:
                 or os.environ.get("VISION_DETECTOR", "0") == "1"
                 or os.environ.get("VISION_RECOVERY_TARGETS", "0") == "1"
             )
+            learned_vision_enabled = (
+                os.environ.get("LEARNED_VISION_SHADOW", "0") == "1"
+                or os.environ.get("LEARNED_VISION_DETECTOR", "0") == "1"
+                or os.environ.get("LEARNED_VISION_RECOVERY_TARGETS", "0")
+                == "1"
+            )
             if vision_enabled:
                 if self._vision_scene_memory is None:
                     self._vision_scene_memory = VisionTask5SceneMemory(self._env)
                 else:
                     self._vision_scene_memory.reset()
                 self._last_vision_scene = self._vision_scene_memory.update(obs)
+            if learned_vision_enabled:
+                if self._learned_vision_scene_memory is None:
+                    self._learned_vision_scene_memory = (
+                        LearnedVisionTask5SceneMemory(self._env)
+                    )
+                else:
+                    self._learned_vision_scene_memory.reset()
+                self._last_learned_vision_scene = (
+                    self._learned_vision_scene_memory.update(obs)
+                )
             self._placement_recovery.reset()
             self._failure_detector.reset()
         self._last_obs = obs
@@ -127,11 +146,31 @@ class TraceEnv:
         use_vision_recovery_targets = (
             os.environ.get("VISION_RECOVERY_TARGETS", "0") == "1"
         )
-        detector_scene = (
-            self._last_vision_scene
-            if use_vision_detector
-            else self._last_scene
+        use_learned_vision_detector = (
+            os.environ.get("LEARNED_VISION_DETECTOR", "0") == "1"
         )
+        use_learned_vision_recovery_targets = (
+            os.environ.get("LEARNED_VISION_RECOVERY_TARGETS", "0") == "1"
+        )
+        if use_learned_vision_detector:
+            detector_scene = self._last_learned_vision_scene
+            detector_source = "learned_vision_scene"
+        elif use_vision_detector:
+            detector_scene = self._last_vision_scene
+            detector_source = "vision_scene"
+        else:
+            detector_scene = self._last_scene
+            detector_source = "scene"
+
+        if use_learned_vision_recovery_targets:
+            recovery_target_scene = self._last_learned_vision_scene
+            recovery_target_source = "learned_vision_scene"
+        elif use_vision_recovery_targets:
+            recovery_target_scene = self._last_vision_scene
+            recovery_target_source = "vision_scene"
+        else:
+            recovery_target_scene = self._last_scene
+            recovery_target_source = "scene"
         if not self._placement_recovery.active:
             failure = self._failure_detector.update(
                 original_action, detector_scene
@@ -139,7 +178,9 @@ class TraceEnv:
         if os.environ.get("PLACE_RECOVERY", "0") == "1":
             recovery_scene = self._last_scene
             external_trigger = failure["grasp_failed"]
-            if use_vision_detector and detector_scene is not None:
+            if (
+                use_vision_detector or use_learned_vision_detector
+            ) and detector_scene is not None:
                 # Detection comes exclusively from vision in this hybrid
                 # experiment. Keep GT positions only as recovery targets.
                 external_trigger = (
@@ -148,11 +189,14 @@ class TraceEnv:
                 )
                 recovery_scene = dict(self._last_scene)
                 recovery_scene["placement_failed"] = False
-            if use_vision_recovery_targets and detector_scene is not None:
-                # Full oracle-mask RGB-D control experiment: both the trigger
-                # and recovery object targets come from vision. EEF remains
-                # ordinary robot state, as it would through ROS / joint state.
-                recovery_scene = dict(detector_scene)
+            if (
+                use_vision_recovery_targets
+                or use_learned_vision_recovery_targets
+            ) and recovery_target_scene is not None:
+                # Full RGB-D control experiment: both the trigger and recovery
+                # targets can come from either oracle-mask or learned vision.
+                # EEF remains ordinary robot state, as it would through ROS.
+                recovery_scene = dict(recovery_target_scene)
                 recovery_scene["placement_failed"] = False
             override, place_phase = self._placement_recovery.compute(
                 original_action,
@@ -236,8 +280,14 @@ class TraceEnv:
             if self._vision_scene_memory is not None
             else None
         )
+        learned_vision_scene = (
+            self._learned_vision_scene_memory.update(obs)
+            if self._learned_vision_scene_memory is not None
+            else None
+        )
         self._last_scene = scene
         self._last_vision_scene = vision_scene
+        self._last_learned_vision_scene = learned_vision_scene
         row = {
             "event": "step",
             "step": self._step,
@@ -245,12 +295,8 @@ class TraceEnv:
             "action": _summary(action),
             "recovery_applied": recovery_applied,
             "recovery_phase": phase_executed,
-            "detector_source": (
-                "vision_scene" if use_vision_detector else "scene"
-            ),
-            "recovery_target_source": (
-                "vision_scene" if use_vision_recovery_targets else "scene"
-            ),
+            "detector_source": detector_source,
+            "recovery_target_source": recovery_target_source,
             "reward": _summary(reward),
             "terminated": _summary(terminated),
             "truncated": _summary(truncated),
@@ -258,6 +304,7 @@ class TraceEnv:
             "obs": _summary(obs),
             "scene": scene,
             "vision_scene": vision_scene,
+            "learned_vision_scene": learned_vision_scene,
             "failure": failure,
         }
         self._file.write(json.dumps(row) + "\n")

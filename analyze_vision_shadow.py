@@ -72,22 +72,22 @@ def observation_key(vision, semantic_key):
     return semantic_key
 
 
-def analyze(path):
+def analyze(path, vision_source="vision_scene"):
     records = [json.loads(line) for line in Path(path).open()]
     rows = [
         row
         for row in records
         if row.get("event") == "step"
         and row.get("scene") is not None
-        and row.get("vision_scene") is not None
+        and row.get(vision_source) is not None
     ]
     success = any(numeric_values(row.get("reward", {})).sum() > 0 for row in rows)
     stage_matches = sum(
-        row["scene"].get("stage") == row["vision_scene"].get("stage")
+        row["scene"].get("stage") == row[vision_source].get("stage")
         for row in rows
     )
     target_instances = Counter(
-        row["vision_scene"].get("target_instance") for row in rows
+        row[vision_source].get("target_instance") for row in rows
     )
 
     print(f"\n{path}")
@@ -105,7 +105,7 @@ def analyze(path):
         min_pixels = None
         for row in rows:
             gt = np.asarray(row["scene"]["positions"][key], dtype=float)
-            vision = row["vision_scene"]
+            vision = row[vision_source]
             estimate = np.asarray(vision["positions"][key], dtype=float)
             delta = estimate - gt
             error = float(np.linalg.norm(delta))
@@ -132,33 +132,34 @@ def analyze(path):
     for field in BOOLEAN_FIELDS:
         matches = sum(
             bool(row["scene"].get(field, False))
-            == bool(row["vision_scene"].get(field, False))
+            == bool(row[vision_source].get(field, False))
             for row in rows
         )
         gt_positive = sum(bool(row["scene"].get(field, False)) for row in rows)
         vision_positive = sum(
-            bool(row["vision_scene"].get(field, False)) for row in rows
+            bool(row[vision_source].get(field, False)) for row in rows
         )
         print(
             f"{field}: agreement={matches / max(len(rows), 1) * 100:.1f}% "
             f"GT_positive={gt_positive} vision_positive={vision_positive} "
             f"first_GT={first_true(rows, 'scene', field)} "
-            f"first_vision={first_true(rows, 'vision_scene', field)}"
+            f"first_vision={first_true(rows, vision_source, field)}"
         )
 
     print("GT stages:    ", transitions(rows, "scene"))
-    print("vision stages:", transitions(rows, "vision_scene"))
+    print(f"{vision_source} stages:", transitions(rows, vision_source))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("trace_dir")
+    parser.add_argument("--vision-source", default="vision_scene")
     args = parser.parse_args()
     paths = sorted(glob.glob(str(Path(args.trace_dir) / "episode_*.jsonl")))
     if not paths:
         raise SystemExit(f"No episode_*.jsonl files found under {args.trace_dir}")
     for path in paths:
-        analyze(path)
+        analyze(path, args.vision_source)
 
 
 if __name__ == "__main__":
